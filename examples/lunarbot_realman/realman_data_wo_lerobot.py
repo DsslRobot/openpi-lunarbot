@@ -17,6 +17,10 @@ import threading
 import json
 from pathlib import Path
 import collections
+import sys
+import select
+import termios
+import tty
 
 import numpy as np
 import cv2
@@ -31,11 +35,11 @@ ARM_PORT = 8080
 
 ## Realsense Cameras Params
 # Find serial numbers using `realsense-viewer` or `rs-enumerate-devices`
-WRIST_CAM_SERIAL = "215422254539"  # Replace with your wrist camera's serial number
-THIRD_VIEW_CAM_SERIAL = "145422251468" # Replace with your 3rd-person camera's serial number
+WRIST_CAM_SERIAL = "243322073824"  # Replace with your wrist camera's serial number
+THIRD_VIEW_CAM_SERIAL = "141722078357" # Replace with your 3rd-person camera's serial number
 IMG_WIDTH = 1280
 IMG_HEIGHT = 720
-IMG_FPS = 30
+IMG_FPS = 15
 TARGET_IMG_SIZE = (256, 256)
 
 ## Data Saving Params
@@ -47,10 +51,27 @@ TIMESTAMP_TOLERANCE = (1.0 / COLLECTION_FPS) / 2.0
 
 # SHARED DATA STRUCTURES
 # Use deques as thread-safe buffers with a max length
-camera_buffer = collections.deque(maxlen=10)
-robot_state_buffer = collections.deque(maxlen=10)
-action_buffer = collections.deque(maxlen=10)
+camera_buffer = collections.deque(maxlen=30)
+robot_state_buffer = collections.deque(maxlen=30)
+action_buffer = collections.deque(maxlen=30)
 stop_event = threading.Event()
+
+
+class KeyPressHandler:
+    def __init__(self):
+        self.old_settings = termios.tcgetattr(sys.stdin)
+
+    def enable_non_blocking_input(self):
+        tty.setcbreak(sys.stdin.fileno())
+
+    def disable_non_blocking_input(self):
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+
+    def key_pressed(self):
+        dr, _, _ = select.select([sys.stdin], [], [], 0)
+        if dr:
+            return sys.stdin.read(1)
+        return None
 
 
 def camera_worker(wrist_serial: str, third_view_serial: str):
@@ -70,6 +91,18 @@ def camera_worker(wrist_serial: str, third_view_serial: str):
         pipelines.append(pipe)
     
     print("Camera thread started.")
+
+    # --- Warm-up loop to allow cameras to auto-adjust ---
+    print("Warming up cameras to allow auto-exposure to settle...")
+    for _ in range(60):  # Discard the first 60 frames
+        try:
+            for p in pipelines:
+                p.wait_for_frames(timeout_ms=1000)
+        except RuntimeError as e:
+            print(f"Error during camera warm-up: {e}")
+            break # Exit warm-up on error
+    print("Cameras are ready.")
+
     while not stop_event.is_set():
         try:
             frames = [p.wait_for_frames(timeout_ms=1000) for p in pipelines]
@@ -141,9 +174,8 @@ def action_worker(arm: RoboticArm):
             
             pose = arm_state_dict.get('pose')
             if not pose: continue
-
-            xyz = pose.position
-            rpy = pose.euler
+            xyz = pose[0:3]
+            rpy = pose[3:6]
             pose_6d = np.array([xyz[0], xyz[1], xyz[2], rpy[0], rpy[1], rpy[2]])
 
             ret_gripper, gripper_state = arm.rm_get_gripper_state()
@@ -160,19 +192,25 @@ def action_worker(arm: RoboticArm):
         time.sleep(0.01)
     print("Action worker thread stopped.")
 
-
-def find_closest_in_buffer(buffer, target_timestamp):
-    """Finds the item in a buffer with the timestamp closest to the target."""
+def find_most_recent_in_buffer(buffer, target_timestamp):
+    """
+    Finds the most recent item in the buffer with a timestamp that is
+    less than or equal to the target timestamp.
+    """
     if not buffer:
         return None, float('inf')
-    
-    # Since deques are not indexable, we convert to a list for searching
-    buffer_list = list(buffer)
-    
-    closest_item = min(buffer_list, key=lambda x: abs(x['timestamp'] - target_timestamp))
-    min_diff = abs(closest_item['timestamp'] - target_timestamp)
-    
-    return closest_item, min_diff
+
+    # Filter for items that occurred at or before the target timestamp
+    valid_items = [item for item in buffer if item['timestamp'] <= target_timestamp]
+
+    if not valid_items:
+        return None, float('inf')
+
+    # Find the most recent item among the valid ones
+    most_recent_item = max(valid_items, key=lambda x: x['timestamp'])
+    time_diff = target_timestamp - most_recent_item['timestamp']
+
+    return most_recent_item, time_diff
 
 
 def main():
@@ -197,10 +235,18 @@ def main():
     print(f"Successfully connected to robot arm (handle: {handle.id}).")
 
     # --- 3. Start Data Collection Loop ---
+    key_handler = KeyPressHandler()
+    key_handler.enable_non_blocking_input()
+
     try:
         while True:
+            # Temporarily disable non-blocking input for user input
+            key_handler.disable_non_blocking_input()
             language_instruction = input("\n>>> Enter the task description for the next episode (e.g., 'pick up the red block'), or 'q' to quit: ")
-            if language_instruction.lower() == 'q': break
+            key_handler.enable_non_blocking_input()
+
+            if language_instruction.lower() == 'q':
+                break
 
             # Create directories for the new episode
             episode_path = output_path / f"episode_{episode_idx:04d}"
@@ -213,7 +259,10 @@ def main():
             with open(episode_path / "metadata.json", "w") as f:
                 json.dump({"task": language_instruction}, f, indent=4)
 
+            # Temporarily disable non-blocking input for user input
+            key_handler.disable_non_blocking_input()
             input(">>> Press [Enter] to START recording this episode...")
+            key_handler.enable_non_blocking_input()
 
             stop_event.clear()
             camera_buffer.clear()
@@ -228,7 +277,7 @@ def main():
             action_thread.start()
 
             time.sleep(2)
-            print(">>> Recording... Press [Enter] to STOP.")
+            print(">>> Recording... Press 'q' to STOP.")
             
             episode_data = []
             last_save_time = time.time()
@@ -236,23 +285,30 @@ def main():
 
             # Main collection loop with timestamp synchronization
             while not stop_event.is_set():
-                if time.time() - last_save_time < 1.0 / COLLECTION_FPS:
-                    time.sleep(0.001)
-                    continue
-                
-                last_save_time = time.time()
-
                 try:
-                    # Use camera as the pacemaker
+                    # Block until a new camera frame is available
                     cam_data = camera_buffer.popleft()
                 except IndexError:
-                    continue # Camera buffer is empty, wait for a frame
+                    # No frame yet, sleep briefly and try again
+                    time.sleep(0.001)
+                    continue
 
                 cam_ts = cam_data['timestamp']
 
-                # Find the closest state and action in their respective buffers
-                state_data, state_diff = find_closest_in_buffer(robot_state_buffer, cam_ts)
-                action_data, action_diff = find_closest_in_buffer(action_buffer, cam_ts)
+                # --- Prune stale data from robot and action buffers ---
+                # Remove entries that are too old to ever be matched.
+                # This prevents the buffers from growing indefinitely with irrelevant data.
+                prune_ts = cam_ts - (1.0 / COLLECTION_FPS) # Prune anything older than one collection interval
+                while robot_state_buffer and robot_state_buffer[0]['timestamp'] < prune_ts:
+                    robot_state_buffer.popleft()
+                
+                while action_buffer and action_buffer[0]['timestamp'] < prune_ts:
+                    action_buffer.popleft()
+                # --- End of Pruning ---
+
+                # Find the most recent state and action that occurred *before* the camera frame
+                state_data, state_diff = find_most_recent_in_buffer(robot_state_buffer, cam_ts)
+                action_data, action_diff = find_most_recent_in_buffer(action_buffer, cam_ts)
 
                 # Check if both are within the tolerance
                 if state_data and action_data and state_diff < TIMESTAMP_TOLERANCE and action_diff < TIMESTAMP_TOLERANCE:
@@ -268,7 +324,9 @@ def main():
                 else:
                     sync_misses += 1
 
-                if msvcrt.kbhit() and msvcrt.getch() == b'\r':
+                # Check for 'q' key press to stop recording
+                key = key_handler.key_pressed()
+                if key and key.lower() == 'q':
                     stop_event.set()
 
             # --- 4. Save the Episode ---
@@ -286,33 +344,36 @@ def main():
             print(f"Saving episode to {episode_path}...")
             
             # Prepare data for bulk saving
-            states = []
-            actions = []
-            timestamps = []
+            trajectory_for_json = []
             
-            for i, step in enumerate(episode_data):
-                # Save images
-                cv2.imwrite(str(img_path / f"{i:04d}.png"), step["image"])
-                cv2.imwrite(str(wrist_img_path / f"{i:04d}.png"), step["wrist_image"])
-                
-                # Collect numpy data
-                states.append(step["state"])
-                actions.append(step["action"])
-                timestamps.append(step["timestamp"])
+            for step in episode_data:
+                # Use the step's timestamp to create a unique filename
+                timestamp_str = f"{step['timestamp']:.6f}"
+                image_filename = f"{timestamp_str}.png"
 
-            # Save all numpy data in a single compressed file
-            np.savez_compressed(
-                episode_path / "trajectory.npz",
-                state=np.array(states),
-                action=np.array(actions),
-                timestamp=np.array(timestamps),
-            )
+                # Save images
+                cv2.imwrite(str(img_path / image_filename), step["image"])
+                cv2.imwrite(str(wrist_img_path / image_filename), step["wrist_image"])
+                
+                # Collect numpy data and add image filenames for JSON serialization
+                trajectory_for_json.append({
+                    "timestamp": step["timestamp"],
+                    "image_path": f"images/{image_filename}",
+                    "wrist_image_path": f"wrist_images/{image_filename}",
+                    "state": step["state"].tolist(),
+                    "action": step["action"].tolist(),
+                })
+
+            # Save all trajectory data in a single human-readable JSON file
+            with open(episode_path / "trajectory.json", "w") as f:
+                json.dump(trajectory_for_json, f, indent=4)
             
             print("Episode saved successfully.")
             episode_idx += 1
 
     finally:
         # --- 5. Release Resources ---
+        key_handler.disable_non_blocking_input()
         print("Cleaning up resources...")
         stop_event.set()
         RoboticArm.rm_destroy()
@@ -320,17 +381,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        import msvcrt
-    except ImportError:
-        import sys, tty, termios, select
-        print("Warning: Non-Windows OS detected. Stopping requires pressing Enter and might be less responsive.")
-        class Msvcrt:
-            def kbhit(self):
-                dr,dw,de = select.select([sys.stdin], [], [], 0)
-                return dr != []
-            def getch(self):
-                return sys.stdin.read(1)
-        msvcrt = Msvcrt()
-
     tyro.cli(main)
