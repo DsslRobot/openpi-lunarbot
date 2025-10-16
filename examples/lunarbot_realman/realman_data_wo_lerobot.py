@@ -40,7 +40,7 @@ THIRD_VIEW_CAM_SERIAL = "141722078357" # Replace with your 3rd-person camera's s
 IMG_WIDTH = 1280
 IMG_HEIGHT = 720
 IMG_FPS = 15
-TARGET_IMG_SIZE = (256, 256)
+
 
 ## Data Saving Params
 DATA_ROOT_DIR = "realman_local_data"
@@ -113,13 +113,11 @@ def camera_worker(wrist_serial: str, third_view_serial: str):
                 continue
 
             images = [np.asanyarray(cf.get_data()) for cf in color_frames]
-            wrist_resized = cv2.resize(images[0], TARGET_IMG_SIZE, interpolation=cv2.INTER_AREA)
-            third_view_resized = cv2.resize(images[1], TARGET_IMG_SIZE, interpolation=cv2.INTER_AREA)
 
             camera_buffer.append({
                 "timestamp": timestamp,
-                "wrist_image": wrist_resized,
-                "image": third_view_resized,
+                "wrist_image": images[0],
+                "image": images[1],
             })
 
         except RuntimeError as e:
