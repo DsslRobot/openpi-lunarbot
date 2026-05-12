@@ -23,6 +23,7 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -93,8 +94,8 @@ class DataConfig:
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
-    # Path to the data filter file for DROID dataset
-    filter_dict_path: str | None = None
+    # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
+    datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
 
 class GroupFactory(Protocol):
@@ -366,8 +367,16 @@ class RLDSDroidDataConfig(DataConfigFactory):
     # Filtering options. Can pass a path to a dictionary that maps episodes to timestep ranges
     # to tuples denoting ranges of time steps to keep (start, end). Episodes are uniquely identified with
     # f"{recording_folderpath}--{file_path}", both of which are present in the RLDS episode metadata.
-    # Path to the filter dictionary file.
-    filter_dict_path: str | None = "gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json"
+
+    # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
+    datasets: Sequence[droid_rlds_dataset.RLDSDataset] = (
+        droid_rlds_dataset.RLDSDataset(
+            name="droid",
+            version="1.0.1",
+            weight=1.0,
+            filter_dict_path="gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json",
+        ),
+    )
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -410,7 +419,7 @@ class RLDSDroidDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             rlds_data_dir=self.rlds_data_dir,
             action_space=self.action_space,
-            filter_dict_path=self.filter_dict_path,
+            datasets=self.datasets,
         )
 
 
@@ -547,6 +556,99 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+
+
+def _get_spacecil_configs():
+    """Lazy import to avoid circular: spacecil/config → rm75_policy → training/config."""
+    import openpi.research.spacecil.config as spacecil_config
+
+    return spacecil_config.get_spacecil_configs()
+
+
+def _get_lunarcompose_configs():
+    """Lazy import to avoid circular: lunarcompose/config → rm75_policy → training/config."""
+    import openpi.research.lunarcompose.config as lunarcompose_config
+
+    return lunarcompose_config.get_lunarcompose_configs()
+
+
+def _get_rm75_pick_place_configs():
+    """Vanilla pi0.5 fine-tuning configs for RM75 single-task pick-and-place."""
+    import os
+
+    from openpi.research.shared.illumination_augment import IlluminationAugmentationConfig
+    from openpi.research.shared.rm75_policy import LeRobotRM75DataConfig
+
+    rm75_repo_id = os.environ.get(
+        "RM75_DATA_REPO_ID",
+        "bingqi/rm_75_pick_place_2_converters_b_side",
+    )
+
+    _lora_freeze = pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+    ).get_freeze_filter()
+
+    return [
+        # LoRA fine-tuning (recommended, ~22.5 GB VRAM)
+        TrainConfig(
+            name="pi05_rm75_pick_place",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotRM75DataConfig(
+                repo_id=rm75_repo_id,
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_base/params"
+            ),
+            freeze_filter=_lora_freeze,
+            ema_decay=None,
+            num_train_steps=30_000,
+            batch_size=48,
+            num_workers=12,
+        ),
+        TrainConfig(
+            name="pi05_rm75_pick_place_illum",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotRM75DataConfig(
+                repo_id=rm75_repo_id,
+                base_config=DataConfig(prompt_from_task=True),
+                illumination_augmentation=IlluminationAugmentationConfig(),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_base/params"
+            ),
+            freeze_filter=_lora_freeze,
+            ema_decay=None,
+            num_train_steps=30_000,
+            batch_size=48,
+            num_workers=12,
+        ),
+        # Full fine-tuning variant (>= 70 GB VRAM)
+        TrainConfig(
+            name="pi05_rm75_pick_place_full",
+            model=pi0_config.Pi0Config(pi05=True),
+            data=LeRobotRM75DataConfig(
+                repo_id=rm75_repo_id,
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_base/params"
+            ),
+            ema_decay=0.99,
+            num_train_steps=30_000,
+            batch_size=32,
+        ),
+    ]
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -739,7 +841,8 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=256,
+        # batch_size=256,
+        batch_size=6,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -754,23 +857,26 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero_lora",
-        # Here is an example of loading a pi05 model for LoRA fine-tuning.
-        model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=False,
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ),
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=True,
+            extra_delta_transform=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
+         # Global batch size.
+        batch_size = 48,
+        # Number of workers to use for the data loader. Increasing this number will speed up data loading but
+        # will increase memory and CPU usage.
+        num_workers = 12,
         # The freeze filter defines which parameters should be frozen during training.
         # We have a convenience function in the model config that returns the default freeze filter
         # for the given model config for LoRA finetuning. Just make sure it matches the model config
         # you chose above.
         freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False,
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
@@ -780,7 +886,7 @@ _CONFIGS = [
     # Fine-tuning Aloha configs.
     #
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
-    # For instuctions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
+    # For instructions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
     TrainConfig(
         name="pi0_aloha_pen_uncap",
         model=pi0_config.Pi0Config(),
@@ -980,10 +1086,12 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
-    #
-    # RoboArena configs.
-    #
+    # RoboArena, PolaRiS, SpaceCIL, LunarCompose, & RM75 pick-place configs.
     *roboarena_config.get_roboarena_configs(),
+    *polaris_config.get_polaris_configs(),
+    *_get_spacecil_configs(),
+    *_get_lunarcompose_configs(),
+    *_get_rm75_pick_place_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

@@ -168,4 +168,7 @@ cython_debug/
 #.idea/
 
 
-.vscode/
+# Oh My OpenCode local configuration
+.opencode/
+
+LunarPressure/
